@@ -2,58 +2,137 @@
 #             Bibliotecas
 # =======================================
 import os
-import pandas as pd
-import numpy as np
+import time
+from dotenv import load_dotenv, find_dotenv
+from os.path import abspath
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, when, month, year, concat_ws, isnan
 
-pd.set_option("display.max_columns", 20)
+# =======================================
+#         Variáveis de Ambiente
+# =======================================
+load_dotenv(find_dotenv())
+url = os.environ.get("url")
+user = os.environ.get("user")
+password = os.environ.get("password")
 
-# ==============================================
-# Pastas e subpastas do projeto
-# ==============================================
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "landing")
+# =======================================
+#             Aplicação
+# =======================================
 
-# ==============================================
-# Extração e validação dos dados
-# ==============================================
+# Setup da aplicação Spark
+spark = (
+    SparkSession.builder.master("local[2]")
+    .appName("Pipeline")
+    .config("spark.sql.warehouse.dir", abspath("spark-warehouse"))
+    .config("fs.s3a.endpoint", url)
+    .config("fs.s3a.access.key", user)
+    .config("fs.s3a.secret.key", password)
+    .config("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("fs.s3a.path.style.access", "True")
+    .getOrCreate()
+)
+
+# Definindo o método de logging da aplicação [INFO ou ERROR]
+spark.sparkContext.setLogLevel("ERROR")
+
+# Lendo os dados do Data Lake
+df = (
+    spark.read.format("com.databricks.spark.csv")
+    .option("header", "True")
+    .option("inferSchema", "True")
+    .csv("s3a://landing/Pakistan_Ecommerce.csv")
+)
+
+# Imprime os dados lidos da landing
+print("\nAmostra dos dados na landing:")
+print(df.show(5, truncate=False))
+print("\nSchema do dataframe")
+print(df.printSchema())
+
+# Converte os dados da landing para o formato parquet
+# e salva na área de processing
 
 
-def read_csv(filename: str, parse_dates: list):
-    """Leitura do arquivo"""
-    df = pd.read_csv(os.path.join(DATA_DIR, filename), parse_dates=parse_dates)
+def convert_data(df: DataFrame, format: str, mode: str, save: str) -> DataFrame:
+    """Convert the .csv file to .parquet"""
+    print(f"\nEscrevendo os dados da landing como parquet na {save[6:16]} zone...\n")
+    (df.write.format(format).mode(mode).save(save))
     return df
 
 
-def validation(df, date: str, id_item: str):
-    """Validando os tipos de dados"""
-    if df.dtypes[[date]].item() == np.object:
-        raise TypeError("O tipo de dado deve ser datetime64[ns].")
-    elif df[[id_item]].isnull().values.any():
-        raise TypeError("A coluna não pode conter valores nulos.")
+# Lendo arquivos parquet
+def read_parquet(df: DataFrame, format: str, parquet: str) -> DataFrame:
+    """Read the .parquet file"""
+    df = spark.read.format(format).parquet(parquet)
+    return df
+
+
+def validation(
+    df: DataFrame, date_column: list[str], id_column: list[str]
+) -> DataFrame:
+    """Validates data types and checks for missing values"""
+    print("Iniciando a transformação dos dados....\n")
+    time.sleep(2.5)
+
+    for item in date_column:
+        df = df.withColumn(item, df[item].cast("date"))
+        if dict(df.dtypes)[item] == "string":
+            raise TypeError(
+                f'Erro: O tipo de dado da coluna "{item}" deve ser datetime64[ns].'
+            )
+        else:
+            print(f'-> O tipo da coluna "{item}" foi convertida para datetime.')
+
+    for id in id_column:
+        if df.filter((df[id].isNull()) | (isnan(df[id]))).count() > 0:
+            raise TypeError(f'Erro: A coluna "{id}" não pode conter valores nulos.')
+        else:
+            print(f'-> A coluna "{id}" não possui valores nulos.')
+    return df
+
+
+def clean(df: DataFrame, replaceCols: list[str]) -> DataFrame:
+    """Replace or change incorrect characters and remove duplicate lines"""
+    count_rows = df.count()
+    df = df.dropDuplicates()
+
+    if df.count() < count_rows:
+        print(f"-> Foram removidas {count_rows - df.count()} linha(s) duplicada(s).")
     else:
-        return df
+        print("-> Não existe linhas duplicadas.")
 
+    for cols in replaceCols:
+        df = df.withColumn(
+            cols,
+            when((col(cols) == "#REF!") | (col(cols) == "***"), None).otherwise(
+                col(cols)
+            ),
+        )
+        print(f"-> Os valores incorretos da coluna {cols} foram substituídos por Null.")
 
-# ==============================================
-# Limpeza dos dados
-# ==============================================
-
-
-def clean(df, columns: list):
-    """Padronizando os valores faltantes e removendo as linhas duplicadas"""
-    df[columns] = df[columns].replace(["***", "#REF!"], np.nan)
-    df = df.drop_duplicates().reset_index(drop=True)
     return df
 
 
-# ==============================================
-# Transformação dos dados
-# ==============================================
+def transformation(df: DataFrame, date: str) -> DataFrame:
+    """Creating the month, year, and month_year columns"""
+    df = df.withColumn("Year", year(df[date]).cast("string"))
+    print('-> Criando a coluna "Year".')
+
+    df = df.withColumn("Month", month(df[date]).cast("string"))
+    print('-> Criando a coluna "Month".')
+
+    df = df.withColumn("Customer_Since", concat_ws("-", col("Year"), col("Month")))
+    print('-> Criando a coluna "Customer_Since".')
+    return df
 
 
-def transformation(df, date):
-    """Criando as colunas de mês, ano e mês_ano"""
-    df["month"] = df[date].dt.month.astype(str)
-    df["year"] = df[date].dt.year.astype(str)
-    df["month_year"] = df["month"] + "-" + df["year"]
+def save_data(df: DataFrame, format: str, mode: str, save: str) -> DataFrame:
+    """Saved the data"""
+    print(f"\nEscrevendo os dados da processing como parquet na {save[6:13]} zone...\n")
+    (df.write.format(format).mode(mode).save(save))
+    print("Os dados foram salvos com sucesso!\n")
+    time.sleep(2.5)
+    print("Amostra de dados na curated")
+    print(df.show(5, truncate=False))
     return df
